@@ -1,4 +1,4 @@
-// CLI link, see cli_link.h.
+// CLI link, see cli_link.h. Supports BLE (slots 0..1), Wi-Fi TCP (slot 2), and 4G LTE reverse tunnel (slot 3).
 #include "cli_link.h"
 #include <Preferences.h>
 #include <esp_heap_caps.h>
@@ -6,13 +6,14 @@
 #include <esp_random.h>
 #include "ble_link.h"
 #include "cli_tcp.h"
+#include "modem_4g.h"
 #include "src/cli/cli_proto.h"
 #include "logbuf.h"
 
 const int MAX_CLIENTS = 4;
 const int BLE_SLOTS = 2;                   // ble_link's MAX_PEERS
-const int SLOTS = BLE_SLOTS + 1;           // + the Wi-Fi link (cli_tcp.h)
-const uint32_t VIDEO_TIMEOUT_MS = 1500;    // as for the app's video
+const int SLOTS = BLE_SLOTS + 2;           // + Wi-Fi TCP (slot 2) + 4G LTE tunnel (slot 3)
+const uint32_t VIDEO_TIMEOUT_MS = 1500;
 
 struct PairedClient {
   uint8_t id[CLI_ID_LEN], key[CLI_KEY_LEN];
@@ -29,14 +30,13 @@ static PairedClient clients[MAX_CLIENTS];
 static int clientCount, nextClient;
 static Session sessions[SLOTS];
 static uint8_t boardId[6];
-static volatile uint32_t gen;  // sessions authenticated since boot
-// Frame buffers in PSRAM (~3.5 KB): one for frames from the computer per receiving task (NimBLE host, cli_tcp),
-// one per sending task.
-static uint8_t *rxText[2], *ctrlBuf, *ctrlOut, *videoOut, *audioOut;
+static volatile uint32_t gen;
+// Frame buffers in PSRAM: one RX per task (0=BLE, 1=Wi-Fi TCP, 2=4G LTE), plus TX buffers.
+static uint8_t *rxText[3], *ctrlBuf, *ctrlOut, *videoOut, *audioOut;
 static volatile bool audioOn;
 const size_t RX_CAP = 520, CTRL_CAP = BOARD_STATUS_CAP, OUT_CAP = CTRL_CAP + CLI_OVERHEAD, VIDEO_CAP = CLI_TCP_MTU;
-const size_t AUDIO_CAP = 1400 + CLI_OVERHEAD;  // one record: header, times, an AAC-ELD frame
-const size_t BUF_SIZE = RX_CAP * 2 + CTRL_CAP + OUT_CAP + VIDEO_CAP + AUDIO_CAP;
+const size_t AUDIO_CAP = 1400 + CLI_OVERHEAD;
+const size_t BUF_SIZE = RX_CAP * 3 + CTRL_CAP + OUT_CAP + VIDEO_CAP + AUDIO_CAP;
 
 extern "C" void cli_random(uint8_t *p, size_t n) { esp_fill_random(p, n); }
 
@@ -48,14 +48,24 @@ static void saveClients() {
   prefs.end();
 }
 
-// The radio under a slot: ble_link's peer slots, or the Wi-Fi link.
-static uint16_t mtu(int slot) { return slot == CLI_TCP_SLOT ? CLI_TCP_MTU + 3 : ble_cli_mtu(slot); }
-static bool linkUp(int slot) { return slot == CLI_TCP_SLOT ? cli_tcp_up() : ble_cli_subscribed(slot); }
+static uint16_t mtu(int slot) {
+  if (slot == CLI_TCP_SLOT) return CLI_TCP_MTU + 3;
+  if (slot == CLI_CELL_SLOT) return CLI_CELL_MTU + 3;
+  return ble_cli_mtu(slot);
+}
+static bool linkUp(int slot) {
+  if (slot == CLI_TCP_SLOT) return cli_tcp_up();
+  if (slot == CLI_CELL_SLOT) return modem_tunnel_up();
+  return ble_cli_subscribed(slot);
+}
 static bool notify(int slot, const uint8_t *p, size_t n, bool video, uint32_t timeout_ms) {
-  return slot == CLI_TCP_SLOT ? cli_tcp_send(p, n, timeout_ms) : ble_cli_notify(slot, p, n, video, timeout_ms);
+  if (slot == CLI_TCP_SLOT) return cli_tcp_send(p, n, timeout_ms);
+  if (slot == CLI_CELL_SLOT) return modem_tunnel_send(p, n, timeout_ms);
+  return ble_cli_notify(slot, p, n, video, timeout_ms);
 }
 static void drop(int slot) {
   if (slot == CLI_TCP_SLOT) cli_tcp_drop();
+  else if (slot == CLI_CELL_SLOT) modem_tunnel_drop();
   else ble_cli_drop(slot);
 }
 
@@ -65,7 +75,8 @@ void cli_begin() {
   if (!p) return;
   rxText[0] = p;
   rxText[1] = p + RX_CAP;
-  ctrlBuf = p + RX_CAP * 2;
+  rxText[2] = p + RX_CAP * 2;
+  ctrlBuf = p + RX_CAP * 3;
   ctrlOut = ctrlBuf + CTRL_CAP;
   videoOut = ctrlOut + OUT_CAP;
   audioOut = videoOut + VIDEO_CAP;
@@ -102,7 +113,8 @@ static void error(int slot, const char *why) { plain(slot, CLI_ERROR, (const uin
 
 static void pair(int slot, const uint8_t *p, size_t n) {
   if (n != 32 + CLI_ID_LEN) return error(slot, "bad pair request");
-  if (slot == CLI_TCP_SLOT) return error(slot, "pair over Bluetooth");  // the pairing window is for whoever is near
+  // Security: never allow unauthenticated key-exchange pairing over Wi-Fi or 4G cellular!
+  if (slot == CLI_TCP_SLOT || slot == CLI_CELL_SLOT) return error(slot, "pair over Bluetooth");
   if (!ble_pair_window_open())
     return error(slot, "pairing window closed: unplug and replug the board, then pair within 3 minutes");
   uint8_t priv[32], pub[32], key[CLI_KEY_LEN];
@@ -113,7 +125,7 @@ static void pair(int slot, const uint8_t *p, size_t n) {
   const uint8_t *id = p + 32;
   int i = findClient(id);
   if (i < 0) {
-    i = clientCount < MAX_CLIENTS ? clientCount++ : nextClient;  // full: replace the oldest
+    i = clientCount < MAX_CLIENTS ? clientCount++ : nextClient;
     nextClient = (i + 1) % MAX_CLIENTS;
   }
   memcpy(clients[i].id, id, CLI_ID_LEN);
@@ -147,23 +159,23 @@ static void hello(int slot, const uint8_t *p, size_t n) {
 
 static void data(int slot, const uint8_t *p, size_t n) {
   Session &s = sessions[slot];
-  uint8_t *text = rxText[slot == CLI_TCP_SLOT];
+  int rxIdx = (slot == CLI_TCP_SLOT) ? 1 : ((slot == CLI_CELL_SLOT) ? 2 : 0);
+  uint8_t *text = rxText[rxIdx];
   uint32_t ctr;
   if (!s.welcomed || !text || n > RX_CAP + CLI_OVERHEAD) return;
   int len = cli_open(s.c2b, 'C', p, n, &ctr, text);
-  if (len < 0) return;  // forged or for another session: ignore
-  if (ctr != s.rx + 1) { drop(slot); return; }  // a replay, or a lost frame: start over
+  if (len < 0) return;
+  if (ctr != s.rx + 1) { drop(slot); return; }
   s.rx = ctr;
   if (!s.authed) {
-    // One computer at a time. The same one may move its session between BLE and Wi-Fi: the new link takes over
-    // and the old one stays up, idle, as its way back.
     int old = cli_slot();
     if (old >= 0 && sessions[old].client != s.client) { drop(slot); return; }
     if (old >= 0) sessions[old].authed = false;
     s.authed = true;
-    audioOn = false;  // asked again by every session
+    audioOn = false;
     gen++;
-    board_log(slot == CLI_TCP_SLOT ? "cli: session up (wifi)" : "cli: session up");
+    board_log(slot == CLI_TCP_SLOT ? "cli: session up (wifi)"
+              : (slot == CLI_CELL_SLOT ? "cli: session up (4g)" : "cli: session up (ble)"));
   }
   if (len > 1 && text[0] == 'c') ble_cli_push_cmd((const char *)text + 1, len - 1);
 }
@@ -186,12 +198,19 @@ bool cli_authed(int slot) { return slot >= 0 && slot < SLOTS && sessions[slot].a
 bool cli_known(int slot) { return slot >= 0 && slot < SLOTS && sessions[slot].welcomed; }
 uint32_t cli_gen() { return gen; }
 bool cli_wifi() { return cli_slot() == CLI_TCP_SLOT; }
+bool cli_cell() { return cli_slot() == CLI_CELL_SLOT; }
+const char *cli_via_name() {
+  int slot = cli_slot();
+  if (slot == CLI_TCP_SLOT) return "wifi";
+  if (slot == CLI_CELL_SLOT) return "cell";
+  return "ble";
+}
 uint16_t cli_mtu() { int slot = cli_slot(); return slot < 0 ? 23 : mtu(slot); }
 
 void cli_drop() {
   int slot = cli_slot();
   if (slot >= 0) drop(slot);
-  for (int i = 0; i < SLOTS; i++)  // and its idle way back
+  for (int i = 0; i < SLOTS; i++)
     if (i != slot && sessions[i].welcomed) drop(i);
 }
 
@@ -207,13 +226,13 @@ bool cli_send_ctrl(char kind, const char *text, size_t n, uint32_t timeout_ms) {
   Session &s = sessions[slot];
   uint8_t *buf = ctrlBuf, *out = ctrlOut;
   size_t room = cli_ctrl_room(mtu(slot));
-  if (kind == 's' && n > room) return false;  // If the link changed, wait for the next complete JSON report.
+  if (kind == 's' && n > room) return false;
   if (n > room) n = room;
   buf[0] = (uint8_t)kind;
   memcpy(buf + 1, text, n);
   size_t len = cli_seal(s.b2c, CLI_DATA, 'B', s.txCtrl + 1, buf, n + 1, out);
   if (!len || !notify(slot, out, len, false, timeout_ms)) {
-    drop(slot);  // the CLI would see a counter gap anyway
+    drop(slot);
     return false;
   }
   s.txCtrl++;
@@ -223,7 +242,7 @@ bool cli_send_ctrl(char kind, const char *text, size_t n, uint32_t timeout_ms) {
 size_t cli_video_room() {
   int slot = cli_slot();
   if (slot < 0 || !linkUp(slot)) return 0;
-  return mtu(slot) - 3 - CLI_OVERHEAD - 3;  // ATT header, the seal, the chunk's own header (VCHUNK_HDR)
+  return mtu(slot) - 3 - CLI_OVERHEAD - 3;
 }
 
 bool cli_send_video(const uint8_t *chunk, size_t n) {
@@ -233,18 +252,18 @@ bool cli_send_video(const uint8_t *chunk, size_t n) {
   uint8_t *out = videoOut;
   if (n > VIDEO_CAP - CLI_OVERHEAD) return false;
   size_t len = cli_seal(s.b2c, CLI_VIDEO, 'V', s.txVideo + 1, chunk, n, out);
-  s.txVideo++;  // a chunk that fails is a gap the CLI handles like a seq gap
+  s.txVideo++;
   return len && notify(slot, out, len, true, VIDEO_TIMEOUT_MS);
 }
 
 void cli_audio(bool on) { audioOn = on; }
-bool cli_audio_wanted() { return audioOn && cli_slot() == CLI_TCP_SLOT; }
+bool cli_audio_wanted() { int slot = cli_slot(); return audioOn && (slot == CLI_TCP_SLOT || slot == CLI_CELL_SLOT); }
 
 bool cli_send_audio(const uint8_t *rec, size_t n) {
   int slot = cli_slot();
-  if (slot != CLI_TCP_SLOT || !audioOut || n + CLI_OVERHEAD > AUDIO_CAP) return false;
+  if ((slot != CLI_TCP_SLOT && slot != CLI_CELL_SLOT) || !audioOut || n + CLI_OVERHEAD > AUDIO_CAP) return false;
   Session &s = sessions[slot];
   size_t len = cli_seal(s.b2c, CLI_AUDIO, 'A', s.txAudio + 1, rec, n, audioOut);
-  s.txAudio++;  // a record that fails is a seq gap for the CLI
+  s.txAudio++;
   return len && notify(slot, audioOut, len, true, VIDEO_TIMEOUT_MS);
 }

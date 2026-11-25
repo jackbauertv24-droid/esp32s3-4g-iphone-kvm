@@ -11,11 +11,12 @@
 #include "tusb.h"
 
 static NimBLEHIDDevice *hidDevice;
-static NimBLECharacteristic *inputs[3];
+static NimBLECharacteristic *inputs[4];  // 0: Rel Mouse (ID 1), 1: Keyboard (ID 2), 2: Consumer (ID 3), 3: Abs Pointer (ID 4)
 static BleHidTarget target;
 static unsigned lastGeneration;
-static bool failed, releasePending;
+static bool failed, releasePending, usedAbsMode;
 static uint8_t mouseButtons, keys[8];
+static uint16_t absX = 16384, absY = 16384;
 static uint32_t batteryAt, lastReportAt;
 static volatile uint32_t reportsSent, reportsFailed, reportsWaited, reportMaxMs;  // ble_hid_diag
 
@@ -24,6 +25,7 @@ static void resetReports() {
   inputs[0]->setValue(zero, 5);
   inputs[1]->setValue(zero, 8);
   inputs[2]->setValue(zero, 2);
+  inputs[3]->setValue(zero, 6);
 }
 
 class HidSubscription : public NimBLECharacteristicCallbacks {
@@ -39,17 +41,18 @@ void ble_hid_begin(NimBLEServer *server) {
   static uint8_t map[] = {
     TUD_HID_REPORT_DESC_MOUSE(HID_REPORT_ID(1)),
     TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(2)),
-    TUD_HID_REPORT_DESC_CONSUMER(HID_REPORT_ID(3))
+    TUD_HID_REPORT_DESC_CONSUMER(HID_REPORT_ID(3)),
+    HID_REPORT_DESC_ABS_POINTER(4)
   };
   hid->setReportMap(map, sizeof map);
-  hid->setManufacturer("ESP32 iPhone Agent");
-  hid->setPnp(2, 0x303a, 0x1001, 0x0101);
+  hid->setManufacturer("ESP32S3 4G KVM");
+  hid->setPnp(2, 0x303a, 0x1001, 0x0102);
   hid->setHidInfo(0, 3);
-  for (int i = 0; i < 3; i++) inputs[i] = hid->getInputReport(i + 1);
+  for (int i = 0; i < 4; i++) inputs[i] = hid->getInputReport(i + 1);
   resetReports();
   inputs[0]->setCallbacks(&hidSubscription);
+  inputs[3]->setCallbacks(&hidSubscription);
   hid->getOutputReport(2)->setValue(uint8_t(0));
-  // Let the board supply the battery level; a board without a battery reports zero.
   hid->setBatteryLevel(board_battery_percent());
   batteryAt = millis();
 }
@@ -77,6 +80,7 @@ bool ble_hid_command_begin(uint32_t session) {
   failed = false;
   if (lastGeneration != session) {
     mouseButtons = 0;
+    usedAbsMode = false;
     memset(keys, 0, sizeof keys);
     releasePending = false;
     lastGeneration = session;
@@ -85,14 +89,12 @@ bool ble_hid_command_begin(uint32_t session) {
 }
 
 bool ble_hid_command_ok() {
-  // A press may already have reached the phone. Retry its release in the main loop.
   if (failed) releasePending = true;
   return !failed;
 }
 
 static void send(int input, const void *data, size_t size) {
   if (failed) return;
-  // A notification can also fail during timer expiry or disconnect cleanup, outside a command.
   int handle = BleHidTarget::peer(lastGeneration);
   uint32_t start = millis();
   for (;;) {
@@ -101,7 +103,6 @@ static void send(int input, const void *data, size_t size) {
       reportsFailed++;
       return;
     }
-    // As in the video path, retry only when the host runs out of buffers.
     os_mbuf *packet = ble_hs_mbuf_from_flat(data, size);
     int rc = packet ? ble_gatts_notify_custom(handle, inputs[input]->getHandle(), packet) : BLE_HS_ENOMEM;
     if (rc == 0) {
@@ -138,13 +139,15 @@ void ble_hid_poll(bool timedHold) {
     hidDevice->setBatteryLevel(board_battery_percent(), true);
     batteryAt = now;
   }
-  // An explicit press_for has its own deadline. Unbounded idle presses still expire after five seconds.
   if (ble_hid_ready() && (releasePending || (!timedHold && mouseButtons && now - lastReportAt >= 5000))) {
     if (!ble_hid_command_begin(lastGeneration)) return;
     uint8_t zero[8] = {};
     send(0, zero, 5);
     send(1, zero, 8);
     send(2, zero, 2);
+    uint8_t absRel[6];
+    hid_pack_abs_report(absRel, 0, absX, absY, 0);
+    send(3, absRel, 6);
     if (!failed) {
 #if DEBUG_SERIAL
       if (releasePending) Serial.println("BLE HID inputs released after command failure");
@@ -159,11 +162,56 @@ void ble_hid_poll(bool timedHold) {
 }
 
 void BleHidMouse::move(int8_t x, int8_t y, int8_t wheel, int8_t pan) {
+  usedAbsMode = false;
   int8_t report[] = {static_cast<int8_t>(mouseButtons), x, y, wheel, pan};
   send(0, report, sizeof report);
 }
-void BleHidMouse::press(uint8_t buttons) { mouseButtons |= buttons; move(0, 0); }
-void BleHidMouse::release(uint8_t buttons) { mouseButtons &= ~buttons; move(0, 0); }
+
+void BleHidMouse::moveTo(long x, long y) {
+  usedAbsMode = true;
+  absX = (uint16_t)constrain(x, 0, (long)FULL);
+  absY = (uint16_t)constrain(y, 0, (long)FULL);
+  uint8_t r[6];
+  hid_pack_abs_report(r, mouseButtons, absX, absY, 0);
+  send(3, r, sizeof r);
+}
+
+void BleHidMouse::glideTo(long x, long y, int step, int ms) {
+  step = max(step, MIN_STEP);
+  x = constrain(x, 0, (long)FULL);
+  y = constrain(y, 0, (long)FULL);
+  long x0 = absX, y0 = absY;
+  long n = min(max(labs(x - x0), labs(y - y0)) / step + 1, MAX_REPORTS);
+  for (long i = 1; i <= n; i++) {
+    moveTo(x0 + (x - x0) * i / n, y0 + (y - y0) * i / n);
+    if (!ble_hid_command_ok()) return;
+    delay(ms);
+  }
+}
+
+void BleHidMouse::press(uint8_t buttons) {
+  mouseButtons |= buttons;
+  if (usedAbsMode) {
+    uint8_t r[6];
+    hid_pack_abs_report(r, mouseButtons, absX, absY, 0);
+    send(3, r, sizeof r);
+  } else {
+    move(0, 0);
+  }
+}
+
+void BleHidMouse::release(uint8_t buttons) {
+  mouseButtons &= ~buttons;
+  if (usedAbsMode) {
+    uint8_t r[6];
+    hid_pack_abs_report(r, mouseButtons, absX, absY, 0);
+    send(3, r, sizeof r);
+  } else {
+    move(0, 0);
+  }
+}
+
+bool BleHidMouse::held() const { return mouseButtons != 0; }
 
 void BleHidKeyboard::press(uint8_t key) {
   if (!hid_key_press(keys, key, KeyboardLayout_en_US)) { failed = true; return; }
@@ -173,9 +221,9 @@ void BleHidKeyboard::releaseAll() { memset(keys, 0, sizeof keys); send(1, keys, 
 size_t BleHidKeyboard::write(uint8_t value) {
   if (value >= 128) { failed = true; return 0; }
   press(value);
-  if (failed) return 0;  // the key-down never reached the phone: not typed
+  if (failed) return 0;
   delay(8);
-  releaseAll();  // if only this fails, the character is in; ble_hid_poll releases the key
+  releaseAll();
   delay(8);
   return 1;
 }

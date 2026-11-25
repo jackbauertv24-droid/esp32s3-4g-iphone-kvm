@@ -38,6 +38,9 @@
 #include "diag.h"
 #include "board_support.h"
 #include "hid_mode.h"
+#include "cam_eye.h"
+#include "modem_4g.h"
+#include "src/hid/ios_macros.h"
 #ifdef HID_TRANSPORT_BLE
 #include "ble_hid.h"
 #endif
@@ -154,6 +157,54 @@ static uint32_t holdSession;  // A timed release belongs to the phone that recei
 #endif
 const long HOLD_MAX_MS = 60000;
 
+// Executes a deterministic iOS gesture macro (homeswipe, controlcenter, unlock, airplay, spotlight)
+// using 0..32767 absolute pointer reports on USB, BLE, or Dual HID!
+#if ABS_POINTER || defined(HID_TRANSPORT_BLE) || defined(HID_DUAL)
+static ios_airplay_coords_t airplayMacroCoords = {22500, 9800, 16384, 14200};
+bool pressCombo(String combo);
+String typeText(const String &s);
+
+static bool executeMacroPlan(const ios_macro_plan_t &plan) {
+  for (int i = 0; i < plan.count; i++) {
+    esp_task_wdt_reset();
+    const ios_macro_step_t &st = plan.steps[i];
+    switch (st.kind) {
+      case IOS_STEP_ABS_MOVE:
+        mouse.moveTo(st.x, st.y);
+        delay(ABS_SETTLE_MS);
+        break;
+      case IOS_STEP_ABS_TAP:
+        mouse.moveTo(st.x, st.y);
+        delay(ABS_SETTLE_MS);
+        mouse.press(MOUSE_LEFT);
+        delay(60);
+        mouse.release(MOUSE_LEFT);
+        break;
+      case IOS_STEP_ABS_SWIPE:
+        mouse.moveTo(st.x, st.y);
+        delay(ABS_SETTLE_MS);
+        mouse.press(MOUSE_LEFT);
+        mouse.glideTo(st.x2, st.y2, st.step_size, STEP_MS);
+        mouse.release(MOUSE_LEFT);
+        break;
+      case IOS_STEP_KEY_COMBO:
+        if (!pressCombo(String(st.text))) return false;
+        break;
+      case IOS_STEP_TYPE_PIN:
+        if (typeText(String(st.text)) != "ok") return false;
+        break;
+      case IOS_STEP_DELAY:
+        for (uint16_t waited = 0; waited < st.delay_ms; waited += 50) {
+          esp_task_wdt_reset();
+          delay(min((int)(st.delay_ms - waited), 50));
+        }
+        break;
+    }
+  }
+  return true;
+}
+#endif
+
 String run(const String &line) {
   int sp = line.indexOf(' ');
   String cmd = sp < 0 ? line : line.substring(0, sp);
@@ -194,18 +245,36 @@ String run(const String &line) {
     return "ok";
   }
   if (cmd == "move") { movePaced(a, b, constrain(c, 1, 40)); return "ok"; }  // c: speed per report (calibration)
-#if ABS_POINTER
-  if (cmd == "abs") {  // absolute position, 0-32767 across the screen; [step]: per report while dragging
+#if ABS_POINTER || defined(HID_TRANSPORT_BLE) || defined(HID_DUAL)
+  if (cmd == "abs") {  // absolute position, 0-32767 across the screen (works over USB, BLE, and Dual HID!)
     if (mouse.held()) {
-      // Lists need the glide (a jump is a flick, and they fly); system gestures need a flick: a glided home swipe
-      // took ~1 s and opened the app switcher instead (2026-11-07). The app sends a big step for those.
-      long step = sscanf(arg.c_str(), "%*ld %*ld %ld", &c) == 1 ? constrain(c, AbsMouse::MIN_STEP, AbsMouse::FULL) : ABS_STEP;
+      long step = sscanf(arg.c_str(), "%*ld %*ld %ld", &c) == 1 ? constrain(c, 64L, 32767L) : ABS_STEP;
       mouse.glideTo(a, b, step, STEP_MS);
     } else {
       mouse.moveTo(a, b);
       delay(ABS_SETTLE_MS);
     }
     return "ok";
+  }
+  if (cmd == "camtap") {  // tap normalized (0..10000) coordinates on the optical camera image using calibrated ROI
+    uint16_t absX = 0, absY = 0;
+    if (!vision_map_cam_to_abs(&cam_vision_mux()->roi, (uint16_t)constrain(a, 0L, 10000L),
+                               (uint16_t)constrain(b, 0L, 10000L), &absX, &absY))
+      return "err tap outside calibrated iPhone screen ROI";
+    mouse.moveTo(absX, absY);
+    delay(ABS_SETTLE_MS);
+    mouse.press(MOUSE_LEFT);
+    delay(60);
+    mouse.release(MOUSE_LEFT);
+    holdUntil = 0;
+    return "ok";
+  }
+  if (cmd == "macro") {
+    ios_macro_plan_t plan;
+    if (!ios_macro_build(arg.c_str(), &airplayMacroCoords, &plan))
+      return "err usage: macro homeswipe|appswitcher|controlcenter|notifications|spotlight|wake|unlock [PIN]|airplay [mx my rx ry]";
+    holdUntil = 0;
+    return executeMacroPlan(plan) ? "ok" : "err macro aborted";
   }
 #endif
   if (cmd == "press") { mouse.press(MOUSE_LEFT); holdUntil = 0; return "ok"; }
@@ -233,10 +302,15 @@ String run(const String &line) {
   if (cmd == "type") return typeText(arg);
   if (cmd == "key") return pressCombo(arg) ? "ok" : "err unknown key";
   if (cmd == "homescreen") {
-    // iOS ignores AC Home over Bluetooth (consumer reports do arrive: volume up shows), and Button 2 goes Home
-    // only after the user maps it in AssistiveTouch, which needs a button the board does not have
-    // (iPhone 15, 2026-11-19). The error sends the app to the swipe up from the home bar.
-    if (hid_ble()) return "err no Home key over Bluetooth HID: swipe up from the home bar";
+    // Upstream failed over BLE HID because iOS ignores Consumer Control AC Home over Bluetooth.
+    // Fix: over BLE HID, automatically execute our deterministic `homeswipe` bottom-bar flick!
+    if (hid_ble()) {
+#if defined(HID_TRANSPORT_BLE) || defined(HID_DUAL)
+      ios_macro_plan_t plan;
+      if (ios_macro_build("homeswipe", NULL, &plan) && executeMacroPlan(plan)) return "ok";
+#endif
+      return "err no Home key over Bluetooth HID";
+    }
     consumer.press(AC_HOME); delay(40); consumer.release();
     return "ok";
   }
@@ -460,7 +534,30 @@ String board(const String &line, const String &id, char who) {
   if (cmd == "logs") return board_log_page(arg);  // the RAM log, a page at a time (logbuf.h)
   if (cmd == "vdbg") return "ok " + video_debug();  // why a frozen screen stays frozen (video_link.cpp)
   if (cmd == "crash") return String("ok rst ") + resetReason() + ", last dump: " + lastCrash;
-  if (cmd == "snap") { video_snap(id, who); return ""; }  // replies when the GOP is sent
+  if (cmd == "snap") { video_snap(id, who); return ""; }  // replies when the GOP (or fallback JPEG) is sent
+  if (cmd == "camsnap") { cam_eye_snap_and_send(id, who, true); return ""; }
+  if (cmd == "eye") {
+    if (!arg.length() || arg == "status") return "ok " + cam_eye_status_json();
+    if (arg == "auto") vision_mux_set_mode(cam_vision_mux(), EYE_MODE_AUTO);
+    else if (arg == "airplay") vision_mux_set_mode(cam_vision_mux(), EYE_MODE_AIRPLAY);
+    else if (arg == "cam") vision_mux_set_mode(cam_vision_mux(), EYE_MODE_CAMERA);
+    else return "err usage: eye [status|auto|airplay|cam]";
+    return "ok " + cam_eye_status_json();
+  }
+  if (cmd == "camroi") {
+    unsigned x0 = 0, y0 = 0, x1 = 0, y1 = 0, rot = 0;
+    if (sscanf(arg.c_str(), "%u %u %u %u %u", &x0, &y0, &x1, &y1, &rot) != 5 ||
+        !cam_eye_set_roi((uint16_t)x0, (uint16_t)y0, (uint16_t)x1, (uint16_t)y1, (uint16_t)rot))
+      return "err usage: camroi <x0> <y0> <x1> <y1> <0|90|180|270> (0..10000)";
+    return "ok";
+  }
+  if (cmd == "camcfg") {
+    int aec = 0, exp = 0, q = 0;
+    if (sscanf(arg.c_str(), "%d %d %d", &aec, &exp, &q) != 3 || !cam_eye_configure(aec, exp, q))
+      return "err usage: camcfg <aec 0|1> <exposure 10..1200> <quality 4..63>";
+    return "ok";
+  }
+  if (cmd == "cell") return modem_4g_command(arg);
   if (cmd == "bench") {
     if (n < 1 || a <= 0 || a > 4096) return "err usage: bench KB (1-4096)";
     video_bench(id, a, who);
@@ -515,8 +612,8 @@ String board(const String &line, const String &id, char who) {
   return drive(line, who);
 }
 
-#if ABS_POINTER
-#define ABS_FIELD "\"abs\":1,"  // in the full and the short status: the app sends `abs` and skips calibration
+#if ABS_POINTER || defined(HID_TRANSPORT_BLE) || defined(HID_DUAL)
+#define ABS_FIELD "\"abs\":1,"  // in the full and the short status: the app/CLI sends `abs` and skips calibration
 #else
 #define ABS_FIELD ""
 #endif
@@ -538,10 +635,11 @@ String statusJson(bool full, char who) {
            (unsigned long)wv_nacks(), (unsigned long)wv_drops());
   // owner: who drives the phone (app, cli, none); the CLI's busy is 1 while that is the app
   bool app = ble_app_active();
-  if (who == FROM_CLI) {  // the CLI's own link, not the app's (ble.mtu above is the app's)
+  if (who == FROM_CLI) {  // the CLI's own link (ble, wifi, or 4g cell), not the app's
     size_t l = strlen(s);
-    snprintf(s + l - 1, sizeof s - l + 1, ",\"link\":{\"via\":\"%s\",\"mtu\":%u,\"kbps\":%lu}}", cli_wifi() ? "wifi" : "ble",
-             cli_mtu(), (unsigned long)(cli_wifi() ? cli_tcp_kbps() : ble_kbps()));
+    uint32_t linkKbps = cli_wifi() ? cli_tcp_kbps() : (cli_cell() ? modem_tunnel_kbps() : ble_kbps());
+    snprintf(s + l - 1, sizeof s - l + 1, ",\"link\":{\"via\":\"%s\",\"mtu\":%u,\"kbps\":%lu}}", cli_via_name(),
+             cli_mtu(), (unsigned long)linkKbps);
   }
   const char *owner = arb_owner_name(arb_owner(app, cli_slot() >= 0));
   size_t len = strlen(s);
@@ -566,7 +664,8 @@ String statusJson(bool full, char who) {
            appHears, cli_audio_wanted());
   if (who == FROM_CLI) {
     len = strlen(s);
-    snprintf(s + len - 1, sizeof s - len + 1, ",\"busy\":%d}", app);
+    snprintf(s + len - 1, sizeof s - len + 1, ",\"busy\":%d,\"bat\":%u,\"eye\":\"%s\",\"tun4g\":%d}",
+             app, board_battery_percent(), vision_active_name(cam_vision_mux()->active), modem_tunnel_up() ? 1 : 0);
   }
   if (full && strlen(s) < sizeof s - 1) return s;
   // On small MTUs, keep control and reconnect fields first; include diagnostics only if they fit.
@@ -583,7 +682,7 @@ String statusJson(bool full, char who) {
   const size_t withLoss = strlen(s);
   snprintf(s + withLoss, sizeof s - withLoss, ",\"rst\":\"%s\",\"ble\":{\"mtu\":%u}", resetReason(), ble_mtu());
   if (who == FROM_CLI)
-    snprintf(s + strlen(s), sizeof s - strlen(s), ",\"link\":{\"via\":\"%s\",\"mtu\":%u}", cli_wifi() ? "wifi" : "ble", cli_mtu());
+    snprintf(s + strlen(s), sizeof s - strlen(s), ",\"link\":{\"via\":\"%s\",\"mtu\":%u}", cli_via_name(), cli_mtu());
   const size_t room = who == FROM_CLI ? cli_ctrl_room(cli_mtu()) : ble_mtu() - 3u;
   if (strlen(s) + 1 > room) s[withLoss + 1 <= room ? withLoss : required] = 0;
   strlcat(s, "}", sizeof s);
@@ -594,10 +693,17 @@ void statusTask(void *) {
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(1000));
     diag_tick();
-    if (!ble_connected()) continue;
-    String s = statusJson(true, FROM_APP);
-    if (s.length() > ble_mtu() - 3u) s = statusJson(false, FROM_APP);
-    ble_status(s);
+    // Status RGB LED: Purple = 4G tunnel active, Green = AirPlay streaming, Amber = Camera fallback, Blue = Idle
+    if (modem_tunnel_up()) board_set_led(16, 0, 24);
+    else if (airplay_state() == AIRPLAY_STREAMING) board_set_led(0, 20, 0);
+    else if (cam_vision_mux()->active == EYE_ACTIVE_CAMERA && cam_eye_available()) board_set_led(20, 12, 0);
+    else board_set_led(0, 0, 12);
+
+    if (ble_connected()) {
+      String s = statusJson(true, FROM_APP);
+      if (s.length() > ble_mtu() - 3u) s = statusJson(false, FROM_APP);
+      ble_status(s);
+    }
     if (cli_slot() >= 0) ble_cli_status(statusJson(true, FROM_CLI), statusJson(false, FROM_CLI));
   }
 }
@@ -675,8 +781,10 @@ void setup() {
   readCrash();
 
   net_begin();
+  cam_eye_begin();
   if (!video_begin()) board_log("video: no PSRAM for the GOP buffer");
   if (!wv_begin()) board_log("video: Wi-Fi video channel failed to start");
+  modem_4g_begin();
 #ifndef HID_TRANSPORT_BLE
   // The signed release channel only ships images for the standard USB board.
   if (board_supports_usb_release() && !ota_begin()) board_log("ota: failed to start");
@@ -713,6 +821,36 @@ void loop() {
     ESP.restart();
   }
   net_poll();
+  {
+    char streamWho = FROM_APP;
+    bool streamingNow = video_anyone_streaming(&streamWho);
+    VideoStats vs = video_stats(streamWho);
+    cam_eye_poll(airplay_state() == AIRPLAY_STREAMING, vs.frozen, streamingNow, streamWho);
+  }
+  {
+    String smsArg, smsSender;
+    sms_cmd_kind_t scmd = modem_4g_pop_sms_action(smsArg, smsSender);
+    if (scmd != SMS_CMD_NONE) {
+      static const char *apNames[] = {"idle", "connected", "streaming"};
+      if (scmd == SMS_CMD_STATUS) {
+        char replySms[160];
+        snprintf(replySms, sizeof replySms, "KVM bat:%u%% 4G:%s ap:%s eye:%s",
+                 board_battery_percent(), modem_tunnel_up() ? "tun" : "ok",
+                 apNames[airplay_state()], vision_active_name(cam_vision_mux()->active));
+        modem_4g_send_sms(smsSender.c_str(), replySms);
+      } else if (scmd == SMS_CMD_WAKE) {
+        drive("macro wake", FROM_CLI);
+      } else if (scmd == SMS_CMD_UNLOCK) {
+        drive(smsArg.length() ? ("macro unlock " + smsArg) : "macro unlock", FROM_CLI);
+      } else if (scmd == SMS_CMD_AIRPLAY) {
+        drive("macro airplay", FROM_CLI);
+      } else if (scmd == SMS_CMD_CAMSNAP) {
+        vision_mux_set_mode(cam_vision_mux(), EYE_MODE_CAMERA);
+      } else if (scmd == SMS_CMD_REBOOT) {
+        restartAt = (millis() + 500) | 1;
+      }
+    }
+  }
 #ifdef M5_STOPWATCH
   // The screen's buttons, as unprompted reply lines like the `app` relay; the app ignores what it doesn't know.
   stopwatch_ui_link(ble_hid_ready(), ble_app_connected());

@@ -1,26 +1,37 @@
 // Mirrored H.264 from AirPlay to BLE, see video_link.h.
 #include "video_link.h"
 #include <esp_heap_caps.h>
+#include "a7670e_pins.h"
 #include "ble_link.h"
 #include "cli_link.h"
 #include "wifi_video.h"
+#include "cam_eye.h"
 #include "src/video/gop.h"
+#include "src/video/vision_mux.h"
 #include "src/airplay/airplay.h"
 #include "logbuf.h"
 
-// GOP since the latest IDR. A still screen gets an IDR only every few minutes (iOS 26: maybe once per mirroring
-// session), so room for ~30 min of AUs at 6 fps (P-frames of a still screen are tiny). When it fills, it freezes
-// (gop.h): a stream that is in step goes on from the tail below, everyone else needs the next IDR (status fz).
+// GOP since the latest IDR. Auto-scales for 2 MB Quad-PSRAM boards (like Waveshare ESP32-S3-A7670E-4G)
+// where upstream's hardcoded 5+ MB allocation (4 MB GOP + 512 KB tail + 512 KB scratch) fails at boot!
 #ifndef GOP_CAP_KB
+#ifdef WAVESHARE_A7670E
+#define GOP_CAP_KB 768
+#else
 #define GOP_CAP_KB 4096  // flash.sh --small-gop: 256, to test a frozen GOP within minutes
 #endif
-const size_t GOP_CAP = GOP_CAP_KB * 1024;
-// AUs, not bytes, filled first: a still screen still sends ~6 small P-frames a second (~380 B each), so 8192 froze the
-// GOP after ~23 min at 3.1 MB (2026-11-22, iPhone X on iOS 16). Room for the bytes to fill first (+128 KB PSRAM).
-const int MAX_AUS = 16384;
-const size_t TAIL_CAP = 512 * 1024;     // the newest AUs after a frozen GOP (a ring), to go on from or resume in
-const int TAIL_AUS = 2048;               // ~380 B a still-screen AU: 1024 filled before the 512 KB
-const size_t SCRATCH_CAP = 512 * 1024;   // largest access unit we forward
+#endif
+#ifdef WAVESHARE_A7670E
+const int DEFAULT_MAX_AUS = 4096;
+const size_t DEFAULT_TAIL_CAP = 192 * 1024;
+const int DEFAULT_TAIL_AUS = 768;
+const size_t DEFAULT_SCRATCH_CAP = 192 * 1024;
+#else
+const int DEFAULT_MAX_AUS = 16384;
+const size_t DEFAULT_TAIL_CAP = 512 * 1024;
+const int DEFAULT_TAIL_AUS = 2048;
+const size_t DEFAULT_SCRATCH_CAP = 512 * 1024;
+#endif
+static size_t scratchCap = DEFAULT_SCRATCH_CAP;
 const size_t MAX_CHUNK = 512;
 
 struct Req {
@@ -56,7 +67,7 @@ static gop_buf gop, tail;
 static volatile bool tailLive;  // the tail holds every AU since the GOP froze (sent ones may be dropped)
 static bool tailTrimmed;        // its oldest AUs were dropped: a resume must land in the tail itself
 static Sink sink = {FROM_APP};
-static SemaphoreHandle_t lock;
+static SemaphoreHandle_t lock, txLock;
 static uint8_t chunk[VCHUNK_HDR + (WV_PAYLOAD > MAX_CHUNK ? WV_PAYLOAD : MAX_CHUNK)];
 static uint32_t winStart, winBytes, winFrames, lastIdr;
 static volatile uint32_t lastAu;
@@ -99,14 +110,13 @@ static bool videoSend(const Sink &s, bool wifi, const uint8_t *p, size_t n) {
 
 // One access unit as chunks. A failed chunk still consumes its seq, so the receiver sees a gap.
 static bool sendAu(Sink &s, const uint8_t *p, size_t n, uint8_t flags, uint32_t ts) {
+  xSemaphoreTake(txLock, portMAX_DELAY);
   bool wifi = appWifi(s);  // one transport per access unit
   size_t room = videoRoom(s);
-  if (room < 5) return false;
+  if (room < 5) { xSemaphoreGive(txLock); return false; }
   vchunk c;
   vchunk_begin(&c, p, n, flags, ts);
   uint16_t &seq = s.seq[sideOf(s.who)];
-  // The app's chunks share one numbering over both links, and its one assembler takes both: a BLE chunk that
-  // lands after newer Wi-Fi ones reads as a ~65535 gap there (2026-11-06, fw 0.2.3). Log every switch.
   static int8_t appLink = -1;  // -1 unknown, 0 BLE, 1 Wi-Fi
   if (s.who == FROM_APP && appLink != (int8_t)wifi) {
     if (appLink >= 0) {
@@ -123,15 +133,16 @@ static bool sendAu(Sink &s, const uint8_t *p, size_t n, uint8_t flags, uint32_t 
       (wifi ? diag.wifiChunks : diag.bleChunks)++;
       if (!ok) (wifi ? diag.wifiFails : diag.bleFails)++;
     }
-    if (!ok) return false;
+    if (!ok) { xSemaphoreGive(txLock); return false; }
   }
+  xSemaphoreGive(txLock);
   return true;
 }
 
 // Copies AU i of generation gen into the sink's scratch; false if the GOP moved on.
 static bool copyAu(Sink &s, uint32_t gen, int i, gop_au *au) {
   xSemaphoreTake(lock, portMAX_DELAY);
-  bool ok = gop.gen == gen && i < gop.n && gop.aus[i].len <= SCRATCH_CAP;
+  bool ok = gop.gen == gen && i < gop.n && gop.aus[i].len <= scratchCap;
   if (ok) {
     *au = gop.aus[i];
     memcpy(s.scratch, gop.arena + au->off, au->len);
@@ -143,7 +154,7 @@ static bool copyAu(Sink &s, uint32_t gen, int i, gop_au *au) {
 // Copies tail AU i into the sink's scratch; false if there is none (yet) or the tail broke off.
 static bool copyTail(Sink &s, uint32_t gen, int i, gop_au *au) {
   xSemaphoreTake(lock, portMAX_DELAY);
-  bool ok = gop.gen == gen && tailLive && s.onTail && i < tail.n && tail.aus[i].len <= SCRATCH_CAP;
+  bool ok = gop.gen == gen && tailLive && s.onTail && i < tail.n && tail.aus[i].len <= scratchCap;
   if (ok) {
     *au = tail.aus[i];
     memcpy(s.scratch, tail.arena + au->off, au->len);
@@ -204,15 +215,27 @@ static bool snapshot(uint32_t *gen, int *n, uint8_t *cfg, size_t *cfg_len, uint3
 static String doSnap(Sink &s) {
   uint8_t *cfg = s.cfg;
   if (!videoRoom(s)) return "err video not subscribed";
+  // Dual-Eye Fallback: if forced to optical camera mode, snap straight from OV2640/OV5640!
+  vision_mux_t *vm = cam_vision_mux();
+  if (cam_eye_available() && vm && vm->mode == EYE_MODE_CAMERA) {
+    return cam_eye_snap_and_send("", s.who, true) ? "ok cam" : "err camera capture failed";
+  }
   for (int attempt = 0; attempt < 3; attempt++) {
     uint32_t gen, cfg_ts;
     size_t cfg_len;
     int n;
     if (!snapshot(&gen, &n, cfg, &cfg_len, &cfg_ts, NULL)) {
+      // Instead of leaving the caller blind when AirPlay is idle or frozen, seamlessly fall back to the camera!
+      if (cam_eye_available() && vm && vm->mode == EYE_MODE_AUTO) {
+        if (cam_eye_snap_and_send("", s.who, true)) return "ok cam";
+      }
       if (frozenNow()) return "err video frozen (restart screen mirroring)";
-      // wait_idr is true from boot; only surface the keyframe wait once mirroring is actually up.
       if (waitingIdrNow() && airplay_state() == AIRPLAY_STREAMING) return "err waiting for keyframe";
       return "err no video (start screen mirroring)";
+    }
+    if (vm && vm->mode == EYE_MODE_AUTO && vm->active == EYE_ACTIVE_CAMERA && cam_eye_available()) {
+      // AirPlay is blacked out (passcode / 2FA sheet): return the optical camera frame so the passcode pad is visible!
+      if (cam_eye_snap_and_send("", s.who, true)) return "ok cam";
     }
     if (!sendAu(s, cfg, cfg_len, VF_CONFIG | VF_SNAP, cfg_ts)) return "err video send failed";
     bool complete = true;
@@ -221,7 +244,7 @@ static String doSnap(Sink &s) {
       complete = copyAu(s, gen, i, &au);
       if (complete && !sendAu(s, s.scratch, au.len, VF_SNAP | (au.idr ? VF_IDR : 0), au.ts)) return "err video send failed";
     }
-    if (complete) return "ok";  // else a new IDR replaced the GOP mid-send: start over with it
+    if (complete) return "ok";
   }
   return "err video changing too fast";
 }
@@ -351,18 +374,51 @@ static void videoTask(void *arg) {
 }
 
 bool video_begin() {
-  uint8_t *arena = (uint8_t *)heap_caps_malloc(GOP_CAP, MALLOC_CAP_SPIRAM);
-  gop_au *aus = (gop_au *)heap_caps_malloc(MAX_AUS * sizeof(gop_au), MALLOC_CAP_SPIRAM);
-  uint8_t *tailArena = (uint8_t *)heap_caps_malloc(TAIL_CAP, MALLOC_CAP_SPIRAM);
-  gop_au *tailAus = (gop_au *)heap_caps_malloc(TAIL_AUS * sizeof(gop_au), MALLOC_CAP_SPIRAM);
-  sink.scratch = (uint8_t *)heap_caps_malloc(SCRATCH_CAP, MALLOC_CAP_SPIRAM);
+  size_t freePsram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  size_t gopCap = (size_t)GOP_CAP_KB * 1024;
+  int maxAus = DEFAULT_MAX_AUS;
+  size_t tailCap = DEFAULT_TAIL_CAP;
+  int tailAus = DEFAULT_TAIL_AUS;
+  scratchCap = DEFAULT_SCRATCH_CAP;
+
+  // Runtime safety net: if flashed onto a 2 MB PSRAM ESP32-S3R2 without WAVESHARE_A7670E, shrink buffers to fit!
+  if (freePsram > 0 && freePsram < 3 * 1024 * 1024 && gopCap > 768 * 1024) {
+    gopCap = 768 * 1024;
+    maxAus = 4096;
+    tailCap = 192 * 1024;
+    tailAus = 768;
+    scratchCap = 192 * 1024;
+  }
+
+  uint8_t *arena = (uint8_t *)heap_caps_malloc(gopCap, MALLOC_CAP_SPIRAM);
+  gop_au *aus = (gop_au *)heap_caps_malloc(maxAus * sizeof(gop_au), MALLOC_CAP_SPIRAM);
+  uint8_t *tailArena = (uint8_t *)heap_caps_malloc(tailCap, MALLOC_CAP_SPIRAM);
+  gop_au *tailAus = (gop_au *)heap_caps_malloc(tailAus * sizeof(gop_au), MALLOC_CAP_SPIRAM);
+  sink.scratch = (uint8_t *)heap_caps_malloc(scratchCap, MALLOC_CAP_SPIRAM);
   sink.reqs = xQueueCreate(4, sizeof(Req));
   if (!arena || !aus || !tailArena || !tailAus || !sink.scratch || !sink.reqs) return false;
-  gop_init(&gop, arena, GOP_CAP, aus, MAX_AUS);
-  gop_init(&tail, tailArena, TAIL_CAP, tailAus, TAIL_AUS);
+  gop_init(&gop, arena, gopCap, aus, maxAus);
+  gop_init(&tail, tailArena, tailCap, tailAus, tailAus);
   lock = xSemaphoreCreateMutex();
+  txLock = xSemaphoreCreateMutex();
   if (xTaskCreatePinnedToCore(videoTask, "video", 6 * 1024, &sink, 2, &sink.task, 1) != pdPASS) return false;
+  board_log("video: allocated %u KB GOP + %u KB tail in PSRAM", (unsigned)(gopCap / 1024), (unsigned)(tailCap / 1024));
   return true;
+}
+
+bool video_send_jpeg(const uint8_t *jpeg, size_t len, bool is_snap, char who) {
+  if (!jpeg || !len || !txLock) return false;
+  char prev = sink.who;
+  if (prev != who) sendTo(sink, who);
+  uint8_t flags = VF_JPEG | (is_snap ? VF_SNAP : 0);
+  return sendAu(sink, jpeg, len, flags, millis());
+}
+
+bool video_anyone_streaming(char *active_who) {
+  char w = owner();
+  if (active_who) *active_who = w;
+  bool wifi = (w == FROM_APP && wv_active());
+  return sink.streaming[sideOf(w)] || wifi;
 }
 
 void video_on_config(const uint8_t *sps_pps, size_t len) {
@@ -373,6 +429,7 @@ void video_on_config(const uint8_t *sps_pps, size_t len) {
 
 void video_on_au(const uint8_t *au, size_t len, bool idr) {
   uint32_t now = millis();
+  vision_mux_on_airplay_au(cam_vision_mux(), len, idr, now);
   if (lastAu && now - lastAu > dMaxGap) dMaxGap = now - lastAu;
   dAus++;
   dBytes += len;
