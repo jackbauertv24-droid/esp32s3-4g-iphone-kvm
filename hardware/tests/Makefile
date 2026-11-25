@@ -27,3 +27,7 @@ check-hid:
 	../build/tests/test_board_ble
 	$(CXX) -std=c++11 -Wall -Wextra -g -fsanitize=address,undefined -DHID_TRANSPORT_BLE=1 -DM5_STOPWATCH=1 -o ../build/tests/test_board_stopwatch test_board_support.cpp ../hid_bridge/board_support.cpp
 	../build/tests/test_board_stopwatch
+	$(CXX) -std=c++11 -Wall -Wextra -g -fsanitize=address,undefined -DWAVESHARE_A7670E=1 -o ../build/tests/test_board_a7670e test_board_support.cpp ../hid_bridge/board_support.cpp
+	../build/tests/test_board_a7670e
+	$(CC) $(CFLAGS) -Werror -o ../build/tests/test_a7670e_kvm test_a7670e_kvm.c $(SRC)/video/vision_mux.c $(SRC)/video/gop.c $(SRC)/hid/ios_macros.c $(SRC)/modem/at_parser.c -lm
+	../build/tests/test_a7670e_kvm

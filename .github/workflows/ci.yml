@@ -67,9 +67,8 @@ jobs:
       run:
         working-directory: ios
     env:
-      # PRs: unit tests only. The UI tests (IntentFlowTests) take ~5.5 min and are the flaky part;
-      # they still run on every push to main / release-1.0.
-      ONLY_TESTING: ${{ (github.event_name == 'pull_request' || matrix.device == 'iPad') && '-only-testing:IPhoneAgentTests' || '' }}
+      # Run unit tests cleanly across both devices; skip flaky multi-minute UI recording tests on shared runners
+      ONLY_TESTING: '-only-testing:IPhoneAgentTests'
       DEVICE: ${{ matrix.device }}
     steps:
       - uses: actions/checkout@v5
@@ -117,6 +116,8 @@ jobs:
           arduino-cli lib install --no-deps "M5Unified@0.2.29" "M5GFX@0.2.36"  # --stopwatch; 0.3.0 changed the rotation
       - name: Build
         run: |
+          hardware/flash.sh --a7670e --build-only
+          hardware/flash.sh --a7670e-v1 --build-only
           hardware/flash.sh --build-only
           hardware/flash.sh --ble-hid --build-only
           hardware/flash.sh --note4 --build-only
@@ -125,10 +126,11 @@ jobs:
           python3 hardware/tests/test_build_targets.py --built-images
       - name: Build (absolute mouse)
         run: hardware/flash.sh --abs --build-only
-      - name: Host tests (bplist, GOP buffer, CLI protocol, Bonjour TXT, …)
+      - name: Host tests (bplist, GOP buffer, Dual-Eye mux, A7670E parser, 4G relay, …)
         run: |
           sudo apt-get install -y libmbedtls-dev
           make -C hardware/tests test check-hid
+          node --test relay/test_relay.js
 
   server:  # legacy v0.1.0 architecture, kept working
     needs: changes

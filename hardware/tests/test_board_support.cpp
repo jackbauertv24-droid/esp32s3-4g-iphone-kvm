@@ -28,8 +28,15 @@ int main() {
   assert(strcmp(firmware_target, "ESPA:stopwatch") == 0);
   puts("StopWatch board hooks reach the screen task");
   return 0;
+#elif defined(WAVESHARE_A7670E)
+  board_begin();
+  assert(board_battery_percent() == 0);
+  assert(strcmp(board_status_fields(), ",\"board\":\"a7670e\",\"cam\":1,\"cell\":1") == 0);
+  assert(!board_supports_usb_release());
+  assert(strcmp(firmware_target, "ESPA:a7670e") == 0);
+  puts("Waveshare ESP32-S3-A7670E-4G board target checks passed");
+  return 0;
 #endif
-  // Non-Note 4 targets must run on a host without Arduino or GPIO, without touching battery or power pins.
   board_begin();
   assert(board_battery_percent() == 0);
   assert(strcmp(board_status_fields(), "") == 0);

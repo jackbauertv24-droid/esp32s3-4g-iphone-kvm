@@ -378,7 +378,7 @@ bool video_begin() {
   size_t gopCap = (size_t)GOP_CAP_KB * 1024;
   int maxAus = DEFAULT_MAX_AUS;
   size_t tailCap = DEFAULT_TAIL_CAP;
-  int tailAus = DEFAULT_TAIL_AUS;
+  int maxTailAus = DEFAULT_TAIL_AUS;
   scratchCap = DEFAULT_SCRATCH_CAP;
 
   // Runtime safety net: if flashed onto a 2 MB PSRAM ESP32-S3R2 without WAVESHARE_A7670E, shrink buffers to fit!
@@ -386,19 +386,19 @@ bool video_begin() {
     gopCap = 768 * 1024;
     maxAus = 4096;
     tailCap = 192 * 1024;
-    tailAus = 768;
+    maxTailAus = 768;
     scratchCap = 192 * 1024;
   }
 
   uint8_t *arena = (uint8_t *)heap_caps_malloc(gopCap, MALLOC_CAP_SPIRAM);
   gop_au *aus = (gop_au *)heap_caps_malloc(maxAus * sizeof(gop_au), MALLOC_CAP_SPIRAM);
   uint8_t *tailArena = (uint8_t *)heap_caps_malloc(tailCap, MALLOC_CAP_SPIRAM);
-  gop_au *tailAus = (gop_au *)heap_caps_malloc(tailAus * sizeof(gop_au), MALLOC_CAP_SPIRAM);
+  gop_au *tailAus = (gop_au *)heap_caps_malloc(maxTailAus * sizeof(gop_au), MALLOC_CAP_SPIRAM);
   sink.scratch = (uint8_t *)heap_caps_malloc(scratchCap, MALLOC_CAP_SPIRAM);
   sink.reqs = xQueueCreate(4, sizeof(Req));
   if (!arena || !aus || !tailArena || !tailAus || !sink.scratch || !sink.reqs) return false;
   gop_init(&gop, arena, gopCap, aus, maxAus);
-  gop_init(&tail, tailArena, tailCap, tailAus, tailAus);
+  gop_init(&tail, tailArena, tailCap, tailAus, maxTailAus);
   lock = xSemaphoreCreateMutex();
   txLock = xSemaphoreCreateMutex();
   if (xTaskCreatePinnedToCore(videoTask, "video", 6 * 1024, &sink, 2, &sink.task, 1) != pdPASS) return false;
